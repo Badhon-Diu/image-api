@@ -2,10 +2,7 @@
 
 // =============================================================================
 //  STUDENT MARK IMAGE-EXTRACTION API  —  imageapi.js
-//  Image-only version: audio pipeline, EJS mobile-upload session flow, and
-//  Vercel-specific paths have all been removed. Built to run on Render.
-//  Large images are resized/compressed with sharp before being sent to the
-//  vision model, so big phone-camera photos don't slow down or break analysis.
+//  Optimized for maximum speed and concurrency. Built to run on Render.
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24,19 +21,21 @@ require('dotenv').config();
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  port: process.env.PORT || 3002, // Render injects PORT automatically
+  port: process.env.PORT || 3002,
   modelscope: {
     baseURL: 'https://api-inference.modelscope.ai/v1',
     apiKey: process.env.MODELSCOPE_TOKEN,
     model: 'Qwen/Qwen3.5-35B-A3B',
   },
-  imageBatchSize:5,      // how many images to send to the vision model concurrently
-  maxImagesPerRequest: 20, // hard cap per API call
-  visionTimeoutMs: 60_000,
-  maxCacheEntries: 500,    // simple bound so the in-memory cache can't grow forever
+  concurrency: 8,               // Max images processed concurrently
+  maxImagesPerRequest: 20,
+  visionTimeoutMs: 45_000,      // Fail fast if API hangs (45s max)
+  maxCacheEntries: 500,
   resize: {
-    maxDimension: 1600,   // longest side, in px, after resize (upscaling never happens)
-    jpegQuality: 85,      // output quality after sharp compresses to JPEG
+    maxDimension: 2048,         
+    fastQuality: 88,            // Fast encoding, still perfect for OCR
+    fallbackQuality: 75,        // Only used if image is massive
+    targetSizeBytes: 4 * 1024 * 1024, 
   },
 };
 
@@ -99,7 +98,7 @@ function buildImagePrompt(students = []) {
   return IMAGE_PROMPT_BASE + `
 
 KNOWN STUDENTS IN THIS CLASS:
-${list}
+ ${list}
 
 If the ID in the image is partially visible or unclear, match it to the closest entry above.
 If only a name is visible, look it up in the list and use that student's ID.`;
@@ -119,7 +118,6 @@ function getCacheKey(buffer, students = []) {
 }
 
 function cacheSet(key, value) {
-  // Bound the cache so a long-running Render instance doesn't leak memory.
   if (imageCache.size >= CONFIG.maxCacheEntries) {
     const oldestKey = imageCache.keys().next().value;
     imageCache.delete(oldestKey);
@@ -127,92 +125,130 @@ function cacheSet(key, value) {
   imageCache.set(key, value);
 }
 
-// Resizes/compresses the image with sharp before it goes to the vision model.
-// This keeps large phone-camera photos (often 4-12 MB) from slowing down or
-// failing the vision API call. Falls back to the original buffer if sharp
-// can't process the file for any reason (corrupt image, unsupported format).
+// ─────────────────────────────────────────────────────────────────────────────
+//  BLAZING FAST IMAGE PREPROCESSING
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function preprocessImage(buffer, originalMimetype) {
   try {
-    const resized = await sharp(buffer)
-      .rotate() // apply EXIF orientation so rotated phone photos come out upright
-      .resize({
-        width: CONFIG.resize.maxDimension,
-        height: CONFIG.resize.maxDimension,
-        fit: 'inside',
-        withoutEnlargement: true, // never upscale small images
-      })
-      .jpeg({ quality: CONFIG.resize.jpegQuality })
-      .toBuffer();
+    const meta = await sharp(buffer).metadata();
+    
+    // 🚀 FAST PATH: If already a small, web-ready image, skip sharp entirely
+    if (
+      originalMimetype === 'image/jpeg' &&
+      !meta.hasAlpha &&
+      meta.width <= 2048 &&
+      meta.height <= 2048 &&
+      buffer.length <= CONFIG.resize.targetSizeBytes
+    ) {
+      return { buffer, mimetype: 'image/jpeg' };
+    }
 
-    return { buffer: resized, mimetype: 'image/jpeg' };
+    let pipeline = sharp(buffer).rotate(); // Auto-orient based on EXIF
+    
+    // Flatten transparency (PNG -> White background)
+    if (meta.hasAlpha) {
+      pipeline = pipeline.flatten({ background: '#ffffff' });
+    }
+    
+    // Only resize if larger than 2048px
+    if (meta.width > 2048 || meta.height > 2048) {
+      pipeline = pipeline.resize({
+        width: 2048,
+        height: 2048,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+    }
+    
+    // Single fast encoding pass
+    let processed = await pipeline.jpeg({ quality: CONFIG.resize.fastQuality }).toBuffer();
+    
+    // Fallback for insanely large images (rare)
+    if (processed.length > CONFIG.resize.targetSizeBytes) {
+      processed = await sharp(processed).jpeg({ quality: CONFIG.resize.fallbackQuality }).toBuffer();
+    }
+    
+    return { buffer: processed, mimetype: 'image/jpeg' };
   } catch (err) {
-    console.warn(`[Image] sharp preprocessing failed (${err.message}), using original buffer`);
+    console.error(`[Image] sharp failed: ${err.message}. Falling back.`);
     return { buffer, mimetype: originalMimetype };
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  ANALYZE A SINGLE IMAGE
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function analyzeImage(file, students = []) {
-  // Cache key is based on the ORIGINAL bytes, so re-uploading the same photo
-  // still hits the cache even though it gets resized fresh each time.
   const cacheKey = getCacheKey(file.buffer, students);
   if (imageCache.has(cacheKey)) {
-    console.log(`[Image] Cache hit: ${file.originalname}`);
     return imageCache.get(cacheKey);
   }
 
-  const originalSizeKb = (file.buffer.length / 1024).toFixed(0);
   const { buffer: processedBuffer, mimetype: processedMimetype } =
     await preprocessImage(file.buffer, file.mimetype);
-  const processedSizeKb = (processedBuffer.length / 1024).toFixed(0);
-  console.log(`[Image] ${file.originalname}: ${originalSizeKb}KB -> ${processedSizeKb}KB`);
 
   const base64  = processedBuffer.toString('base64');
   const dataUrl = `data:${processedMimetype};base64,${base64}`;
   const prompt  = buildImagePrompt(students);
 
-  const { signal, clear } = createTimeout(CONFIG.visionTimeoutMs);
+  let attempt = 0;
+  const maxRetries = 2;
 
-  try {
-    const resp = await fetch(`${CONFIG.modelscope.baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${CONFIG.modelscope.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: CONFIG.modelscope.model,
-        max_tokens: 1000,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ],
-        }],
-        stream: false,
-      }),
-      signal,
-    });
+  while (true) {
+    const { signal, clear } = createTimeout(CONFIG.visionTimeoutMs);
+    try {
+      const resp = await fetch(`${CONFIG.modelscope.baseURL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${CONFIG.modelscope.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: CONFIG.modelscope.model,
+          max_tokens: 1000,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ],
+          }],
+          stream: false,
+        }),
+        signal,
+      });
 
-    const responseText = await resp.text();
+      const responseText = await resp.text();
+      clear();
 
-    if (!resp.ok) {
-      throw new Error(`ModelScope error ${resp.status}: ${responseText}`);
+      // Smart Retry on Rate Limit (429) or Server Error (5xx)
+      if ((resp.status === 429 || resp.status >= 500) && attempt < maxRetries) {
+        console.warn(`[ModelScope] Error ${resp.status}. Retrying in ${attempt + 1}s...`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        attempt++;
+        continue;
+      }
+
+      if (!resp.ok) {
+        throw new Error(`ModelScope error ${resp.status}: ${responseText}`);
+      }
+
+      const data = JSON.parse(responseText);
+      const rawOutput = data.choices?.[0]?.message?.content;
+      
+      if (!rawOutput || rawOutput.trim() === '') {
+        throw new Error('Vision model returned an empty response');
+      }
+
+      cacheSet(cacheKey, rawOutput);
+      return rawOutput;
+    } catch (err) {
+      clear();
+      // Do not retry on timeouts or network errors, fail fast to save user time
+      throw err;
     }
-
-    const h = resp.headers;
-    console.log(`[ModelScope Quota] Daily: ${h.get('modelscope-ratelimit-requests-remaining')}/${h.get('modelscope-ratelimit-requests-limit')} | Model: ${h.get('modelscope-ratelimit-model-requests-remaining')}/${h.get('modelscope-ratelimit-model-requests-limit')}`);
-
-    const data = JSON.parse(responseText);
-    const rawOutput = data.choices?.[0]?.message?.content;
-    if (!rawOutput || rawOutput.trim() === '') {
-      throw new Error(`Vision model (${CONFIG.modelscope.model}) returned an empty response`);
-    }
-
-    cacheSet(cacheKey, rawOutput);
-    return rawOutput;
-  } finally {
-    clear();
   }
 }
 
@@ -221,20 +257,24 @@ function parseImageOutput(rawText) {
     throw new Error('Vision model output was empty');
   }
   let cleanJson = stripThinkingBlock(rawText);
-  const fenceMatch = cleanJson.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) cleanJson = fenceMatch[1].trim();
   const objectMatch = cleanJson.match(/\{[\s\S]*\}/);
   if (objectMatch) cleanJson = objectMatch[0];
-  const parsed = JSON.parse(cleanJson);
-  const items = Array.isArray(parsed) ? parsed : [parsed];
-  return items.map(item => ({
-    'student id': item['student id'] || item.studentId || item.student_id || item.studentid || 'N/A',
-    mark: normalizeMark(item.mark),
-  }));
+  
+  try {
+    const parsed = JSON.parse(cleanJson);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    return items.map(item => ({
+      'student id': item['student id'] || item.studentId || item.student_id || item.studentid || 'N/A',
+      mark: normalizeMark(item.mark),
+    }));
+  } catch (e) {
+    console.error("Failed to parse JSON:", cleanJson);
+    return [{ 'student id': 'N/A', mark: 0 }];
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SECTION 6 — MULTER (in-memory, no disk writes needed for Render)
+//  SECTION 6 — MULTER
 // ─────────────────────────────────────────────────────────────────────────────
 
 const imageUpload = multer({
@@ -265,18 +305,12 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     visionModel: CONFIG.modelscope.model,
-    batchSize: CONFIG.imageBatchSize,
+    concurrency: CONFIG.concurrency,
     cacheSize: imageCache.size,
-    resize: CONFIG.resize,
   });
 });
 
 // ── Image Analysis ──────────────────────────────────────────────────────────
-// POST /api/analyze-images
-//   multipart/form-data
-//     images   -> one or more image files (field name "images", up to maxImagesPerRequest)
-//     students -> optional JSON string: [{ "id": "232-15-241", "name": "Rahim" }, ...]
-//   Response: [{ "student id": "232-15-241", "mark": 17 }, ...]  (one entry per image, in order)
 
 app.post('/api/analyze-images', imageUpload.array('images', CONFIG.maxImagesPerRequest), async (req, res) => {
   const files = req.files;
@@ -286,29 +320,39 @@ app.post('/api/analyze-images', imageUpload.array('images', CONFIG.maxImagesPerR
 
   let students = [];
   if (req.body.students) {
-    try { students = JSON.parse(req.body.students); } catch { /* ignore bad JSON */ }
+    try { students = JSON.parse(req.body.students); } catch { /* ignore */ }
   }
 
-  const batchSize = CONFIG.imageBatchSize;
-  const allResults = [];
+  const results = new Array(files.length);
+  let currentIndex = 0;
 
-  for (let i = 0; i < files.length; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-    const batchResults = await Promise.all(
-      batch.map(async (file) => {
-        try {
-          const rawOutput = await analyzeImage(file, students);
-          return parseImageOutput(rawOutput);
-        } catch (err) {
-          console.error(`[Image] Failed for ${file.originalname}: ${err.message}`);
-          return [{ 'student id': 'N/A', mark: 0 }];
-        }
-      })
-    );
-    allResults.push(...batchResults.flat());
+  // 🚀 DYNAMIC WORKER POOL
+  // Processes up to CONFIG.concurrency images at a time. As soon as one finishes,
+  // the next one starts immediately. No waiting for slow batch members.
+  async function worker() {
+    while (currentIndex < files.length) {
+      const myIndex = currentIndex++;
+      const file = files[myIndex];
+      try {
+        const rawOutput = await analyzeImage(file, students);
+        results[myIndex] = parseImageOutput(rawOutput);
+      } catch (err) {
+        console.error(`[Image] Failed for ${file.originalname}: ${err.message}`);
+        results[myIndex] = [{ 'student id': 'N/A', mark: 0 }];
+      }
+    }
   }
 
-  return res.json(allResults);
+  // Start workers
+  const workers = [];
+  const workerCount = Math.min(CONFIG.concurrency, files.length);
+  for (let i = 0; i < workerCount; i++) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+
+  return res.json(results.flat());
 });
 
 // ── Global Error Handler ────────────────────────────────────────────────────
@@ -328,7 +372,7 @@ app.use((err, _req, res, _next) => {
 app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log(`✓ Image API running on port ${CONFIG.port}`);
   console.log(`✓ Vision model : ${CONFIG.modelscope.model}`);
-  console.log(`✓ Image batch  : ${CONFIG.imageBatchSize} per batch`);
+  console.log(`✓ Concurrency  : ${CONFIG.concurrency} parallel images`);
 });
 
 module.exports = app;
