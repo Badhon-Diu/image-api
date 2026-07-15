@@ -42,9 +42,9 @@ const CONFIG = {
     apiKey: process.env.MODELSCOPE_TOKEN,
     model: 'Qwen/Qwen3.5-35B-A3B',
   },
-  concurrency: 8,               // Max images processed concurrently
+  concurrency: 5,               // Max images processed concurrently
   maxImagesPerRequest: 20,
-  visionTimeoutMs: 45_000,      // Fail fast if API hangs (45s max)
+  visionTimeoutMs: 360_000,      // Fail fast if API hangs (45s max)
   maxCacheEntries: 500,
   resize: {
     maxDimension: 2048,         
