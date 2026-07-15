@@ -98,6 +98,7 @@ function stripThinkingBlock(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const IMAGE_PROMPT_BASE = `
+/no_think
 You are an OCR extraction tool. Look at this test paper image and extract exactly two values.
 
 WHAT TO FIND:
@@ -114,7 +115,7 @@ WHAT TO FIND:
    Extract it as a plain integer only (e.g. write 17, not "17/20").
 
 STRICT OUTPUT RULES:
-- After your thinking, output ONLY this exact JSON object. Nothing else. No explanation. No markdown. No backticks.
+- Output ONLY this exact JSON object. Nothing else. No explanation. No markdown. No backticks. No thinking.
 - Format: {"student id": "value here", "mark": number here}
 - Example: {"student id": "232-15-290", "mark": 17}
 - If a value cannot be found, use null for that field.
@@ -262,6 +263,7 @@ async function analyzeImage(file, students = []) {
             ],
           }],
           stream: false,
+          enable_thinking: false,
         }),
         signal,
       });
